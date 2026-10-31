@@ -1,0 +1,151 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Product {
+  id                  String           @id @default(cuid())
+  name                String
+  sku                 String           @unique
+  barcode             String?          @unique
+  category            String?
+  unit                String           @default("piece")
+  sellingPricePesewas Int
+  costPricePesewas    Int?
+  stockQuantity       Int              @default(0)
+  lowStockThreshold   Int              @default(5)
+  isActive            Boolean          @default(true)
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+  stockMovements      StockMovement[]
+  salesItems          SaleItem[]
+  returnItems         SaleReturnItem[]
+}
+
+model StockMovement {
+  id             String   @id @default(cuid())
+  productId      String
+  type           String
+  quantityChange Int
+  reason         String
+  note           String?
+  createdAt      DateTime @default(now())
+  product        Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([productId, createdAt])
+}
+
+model Sale {
+  id                String   @id @default(cuid())
+  receiptNumber     String   @unique
+  subtotalPesewas   Int
+  totalPesewas      Int
+  amountPaidPesewas Int
+  changePesewas     Int      @default(0)
+  paymentMethod     String
+  status            String   @default("completed")
+  createdAt         DateTime @default(now())
+  staffId String?
+  staff   Staff? @relation(fields: [staffId], references: [id], onDelete: SetNull)
+  items    SaleItem[]
+  payments Payment[]
+  returns  SaleReturn[]
+}
+
+model SaleItem {
+  id               String @id @default(cuid())
+  saleId           String
+  productId        String
+  productName      String
+  sku              String
+  quantity         Int
+  unitPricePesewas Int
+  unitCostPesewas  Int?
+  lineTotalPesewas Int
+
+  sale        Sale             @relation(fields: [saleId], references: [id], onDelete: Restrict)
+  product     Product          @relation(fields: [productId], references: [id], onDelete: Restrict)
+  returnItems SaleReturnItem[]
+
+  @@index([saleId])
+  @@index([productId])
+}
+
+model Payment {
+  id            String   @id @default(cuid())
+  saleId        String
+  method        String
+  amountPesewas Int
+  reference     String?
+  createdAt     DateTime @default(now())
+
+  sale Sale @relation(fields: [saleId], references: [id], onDelete: Restrict)
+
+  @@index([saleId])
+}
+
+model SaleReturn {
+  id                  String   @id @default(cuid())
+  returnNumber        String   @unique
+  saleId              String
+  refundAmountPesewas Int
+  refundMethod        String
+  reason              String?
+  createdAt           DateTime @default(now())
+
+  sale  Sale             @relation(fields: [saleId], references: [id], onDelete: Restrict)
+  items SaleReturnItem[]
+
+  @@index([saleId, createdAt])
+}
+
+model SaleReturnItem {
+  id               String   @id @default(cuid())
+  saleReturnId     String
+  saleItemId       String
+  productId        String
+  productName      String
+  quantity         Int
+  unitPricePesewas Int
+  restocked        Boolean  @default(true)
+  createdAt        DateTime @default(now())
+
+  saleReturn SaleReturn @relation(fields: [saleReturnId], references: [id], onDelete: Restrict)
+  saleItem   SaleItem   @relation(fields: [saleItemId], references: [id], onDelete: Restrict)
+  product    Product    @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([saleReturnId])
+  @@index([saleItemId])
+  @@index([productId])
+}
+
+
+model Staff {
+  id           String    @id @default(cuid())
+  username     String    @unique
+  passwordHash String
+  role         String    @default("CASHIER")
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  sessions     Session[]
+  sales        Sale[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  staffId   String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  staff     Staff    @relation(fields: [staffId], references: [id], onDelete: Cascade)
+
+  @@index([staffId])
+  @@index([expiresAt])
+}
