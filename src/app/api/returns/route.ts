@@ -1,6 +1,6 @@
 ﻿
 import { NextResponse } from "next/server";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { prisma } from "@/lib/prisma";
 import { requireAdmin } from "@/lib/auth";
 
@@ -10,15 +10,14 @@ type ReturnRequestItem = {
   restocked?: boolean;
 };
 
-type ReturnRequest = {
-  receiptNumber: string;
-  items: ReturnRequestItem[];
-  refundMethod: string;
-  reason?: string;
-};
-
 const allowedRefundMethods = ["cash", "mobile_money", "card"];
 const MAX_STOCK_QUANTITY = 2147483647;
+
+type ReturnResponse = {
+  returnNumber: string;
+  receiptNumber: string;
+  refundAmountPesewas: number;
+};
 
 function errorResponse(message: string, status: number) {
   return NextResponse.json({ error: message }, { status });
@@ -43,11 +42,49 @@ function createReturnNumber() {
   return `RET-${datePart}-${randomUUID().replace(/-/g, "").slice(0, 8).toUpperCase()}`;
 }
 
+function createRequestHash(data: {
+  receiptNumber: string;
+  refundMethod: string;
+  reason: string;
+  items: Array<{
+    saleItemId: string;
+    quantity: number;
+    restocked: boolean;
+  }>;
+}) {
+  const normalized = {
+    receiptNumber: data.receiptNumber,
+    refundMethod: data.refundMethod,
+    reason: data.reason,
+    items: [...data.items].sort((a, b) =>
+      a.saleItemId.localeCompare(b.saleItemId)
+    ),
+  };
+
+  return createHash("sha256")
+    .update(JSON.stringify(normalized))
+    .digest("hex");
+}
+
+function returnResponse(data: ReturnResponse, status: number) {
+  return NextResponse.json(data, { status });
+}
+
 export async function POST(request: Request) {
   const auth = await requireAdmin();
 
   if (auth.error) {
     return auth.error;
+  }
+
+  const idempotencyKey = request.headers.get("Idempotency-Key")?.trim() ?? "";
+
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      idempotencyKey
+    )
+  ) {
+    return errorResponse("A valid Idempotency-Key UUID is required.", 400);
   }
 
   let rawBody: unknown;
@@ -126,7 +163,10 @@ export async function POST(request: Request) {
       !Number.isSafeInteger(quantity) ||
       quantity <= 0
     ) {
-      return errorResponse("Return quantities must be positive whole numbers.", 400);
+      return errorResponse(
+        "Return quantities must be positive whole numbers.",
+        400
+      );
     }
 
     if (restocked !== undefined && typeof restocked !== "boolean") {
@@ -134,8 +174,16 @@ export async function POST(request: Request) {
     }
 
     const existing = combinedItems.get(saleItemId);
+    const restockValue = restocked !== false;
 
     if (existing) {
+      if (existing.restocked !== restockValue) {
+        return errorResponse(
+          "Duplicate item entries must use the same restocking choice.",
+          400
+        );
+      }
+
       const combinedQuantity = existing.quantity + quantity;
 
       if (!Number.isSafeInteger(combinedQuantity)) {
@@ -147,15 +195,78 @@ export async function POST(request: Request) {
       combinedItems.set(saleItemId, {
         saleItemId,
         quantity,
-        restocked: restocked !== false,
+        restocked: restockValue,
       });
     }
   }
 
   const items = Array.from(combinedItems.values());
 
+  const requestHash = createRequestHash({
+    receiptNumber,
+    refundMethod,
+    reason,
+    items,
+  });
+
+  // Check whether this exact request was already completed.
+  try {
+    const existingReturn = await prisma.saleReturn.findUnique({
+      where: { idempotencyKey },
+      select: {
+        returnNumber: true,
+        refundAmountPesewas: true,
+        returnRequestHash: true,
+      },
+    });
+
+    if (existingReturn) {
+      if (existingReturn.returnRequestHash !== requestHash) {
+        return errorResponse(
+          "This request key has already been used with different return details.",
+          409
+        );
+      }
+
+      return returnResponse(
+        {
+          returnNumber: existingReturn.returnNumber,
+          receiptNumber,
+          refundAmountPesewas: existingReturn.refundAmountPesewas,
+        },
+        200
+      );
+    }
+  } catch (error) {
+    console.error("Failed to check return request:", error);
+    return errorResponse("Could not verify the return request.", 500);
+  }
+
   try {
     const result = await prisma.$transaction(async (tx) => {
+      // Check again inside the transaction to protect against retries.
+      const existingReturn = await tx.saleReturn.findUnique({
+        where: { idempotencyKey },
+        select: {
+          returnNumber: true,
+          refundAmountPesewas: true,
+          returnRequestHash: true,
+        },
+      });
+
+      if (existingReturn) {
+        if (existingReturn.returnRequestHash !== requestHash) {
+          throw new Error("IDEMPOTENCY_KEY_CONFLICT");
+        }
+
+        return {
+          returnNumber: existingReturn.returnNumber,
+          receiptNumber,
+          refundAmountPesewas: existingReturn.refundAmountPesewas,
+          replayed: true,
+        };
+      }
+
       const sale = await tx.sale.findUnique({
         where: { receiptNumber },
         include: { items: true },
@@ -193,13 +304,10 @@ export async function POST(request: Request) {
           throw new Error("ITEM_NOT_IN_SALE");
         }
 
-        const previousReturns = await tx.saleReturnItem.aggregate({
-          where: { saleItemId: saleItem.id },
-          _sum: { quantity: true },
-        });
-
-        const alreadyReturned = previousReturns._sum.quantity ?? 0;
-        const remainingQuantity = saleItem.quantity - alreadyReturned;
+        // This is an early validation only. The conditional update below is
+        // the authoritative concurrency-safe check.
+        const remainingQuantity =
+          saleItem.quantity - saleItem.returnedQuantity;
 
         if (
           !Number.isSafeInteger(remainingQuantity) ||
@@ -209,12 +317,10 @@ export async function POST(request: Request) {
           throw new Error("RETURN_QUANTITY_EXCEEDED");
         }
 
-        const lineRefund = saleItem.unitPricePesewas * requested.quantity;
+        const lineRefund =
+          saleItem.unitPricePesewas * requested.quantity;
 
-        if (
-          !Number.isSafeInteger(lineRefund) ||
-          lineRefund < 0
-        ) {
+        if (!Number.isSafeInteger(lineRefund) || lineRefund <= 0) {
           throw new Error("INVALID_REFUND_AMOUNT");
         }
 
@@ -238,11 +344,44 @@ export async function POST(request: Request) {
         throw new Error("INVALID_REFUND_AMOUNT");
       }
 
+      // Atomically reserve each returned quantity inside this transaction.
+      // If another request has already consumed the remaining quantity, the
+      // conditional update affects zero rows and the entire transaction rolls back.
+      for (const item of preparedItems) {
+        const saleItem = sale.items.find(
+          (candidate) => candidate.id === item.saleItemId
+        );
+
+        if (!saleItem) {
+          throw new Error("ITEM_NOT_IN_SALE");
+        }
+
+        const counterUpdate = await tx.saleItem.updateMany({
+          where: {
+            id: item.saleItemId,
+            returnedQuantity: {
+              lte: saleItem.quantity - item.quantity,
+            },
+          },
+          data: {
+            returnedQuantity: {
+              increment: item.quantity,
+            },
+          },
+        });
+
+        if (counterUpdate.count !== 1) {
+          throw new Error("RETURN_QUANTITY_EXCEEDED");
+        }
+      }
+
       const returnNumber = createReturnNumber();
 
       const saleReturn = await tx.saleReturn.create({
         data: {
           returnNumber,
+          idempotencyKey,
+          returnRequestHash: requestHash,
           saleId: sale.id,
           refundAmountPesewas,
           refundMethod,
@@ -266,20 +405,20 @@ export async function POST(request: Request) {
         }
 
         const updatedProduct = await tx.product.updateMany({
-  where: {
-    id: item.productId,
-    stockQuantity: {
-      lte: MAX_STOCK_QUANTITY - item.quantity,
-    },
-  },
-  data: {
-    stockQuantity: { increment: item.quantity },
-  },
-});
+          where: {
+            id: item.productId,
+            stockQuantity: {
+              lte: MAX_STOCK_QUANTITY - item.quantity,
+            },
+          },
+          data: {
+            stockQuantity: { increment: item.quantity },
+          },
+        });
 
-if (updatedProduct.count !== 1) {
-  throw new Error("STOCK_LIMIT_EXCEEDED");
-}
+        if (updatedProduct.count !== 1) {
+          throw new Error("STOCK_LIMIT_EXCEEDED");
+        }
 
         await tx.stockMovement.create({
           data: {
@@ -296,18 +435,60 @@ if (updatedProduct.count !== 1) {
         returnNumber: saleReturn.returnNumber,
         receiptNumber,
         refundAmountPesewas: saleReturn.refundAmountPesewas,
+        replayed: false,
       };
     });
 
-    return NextResponse.json(result, { status: 201 });
-  } catch (error) {
+    const { replayed, ...responseBody } = result;
 
-if (isKnownError(error, "STOCK_LIMIT_EXCEEDED")) {
-  return errorResponse(
-    "Restocking would exceed the maximum supported stock quantity. No return was completed.",
-    400
-  );
-}
+    return returnResponse(responseBody, replayed ? 200 : 201);
+  } catch (error) {
+    // If another identical request completed while this one was running,
+    // retrieve its saved result instead of creating another return.
+    try {
+      const existingReturn = await prisma.saleReturn.findUnique({
+        where: { idempotencyKey },
+        select: {
+          returnNumber: true,
+          refundAmountPesewas: true,
+          returnRequestHash: true,
+        },
+      });
+
+      if (existingReturn) {
+        if (existingReturn.returnRequestHash !== requestHash) {
+          return errorResponse(
+            "This request key has already been used with different return details.",
+            409
+          );
+        }
+
+        return returnResponse(
+          {
+            returnNumber: existingReturn.returnNumber,
+            receiptNumber,
+            refundAmountPesewas: existingReturn.refundAmountPesewas,
+          },
+          200
+        );
+      }
+    } catch (lookupError) {
+      console.error("Could not verify a previous return:", lookupError);
+    }
+
+    if (isKnownError(error, "IDEMPOTENCY_KEY_CONFLICT")) {
+      return errorResponse(
+        "This request key has already been used with different return details.",
+        409
+      );
+    }
+
+    if (isKnownError(error, "STOCK_LIMIT_EXCEEDED")) {
+      return errorResponse(
+        "Restocking would exceed the maximum supported stock quantity. No return was completed.",
+        400
+      );
+    }
 
     if (isKnownError(error, "SALE_NOT_FOUND")) {
       return errorResponse("Sale receipt was not found.", 404);
@@ -345,7 +526,7 @@ if (isKnownError(error, "STOCK_LIMIT_EXCEEDED")) {
     console.error("Failed to process return:", error);
 
     return errorResponse(
-      "Could not process the return. No return should be considered successful unless it was saved.",
+      "Could not process the return. Check the return history before retrying.",
       500
     );
   }

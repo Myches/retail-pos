@@ -1,3 +1,4 @@
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -40,20 +41,22 @@ model StockMovement {
 }
 
 model Sale {
-  id                String   @id @default(cuid())
-  receiptNumber     String   @unique
-  subtotalPesewas   Int
-  totalPesewas      Int
-  amountPaidPesewas Int
-  changePesewas     Int      @default(0)
-  paymentMethod     String
-  status            String   @default("completed")
-  createdAt         DateTime @default(now())
-  staffId String?
-  staff   Staff? @relation(fields: [staffId], references: [id], onDelete: SetNull)
-  items    SaleItem[]
-  payments Payment[]
-  returns  SaleReturn[]
+  id                  String       @id @default(cuid())
+  receiptNumber       String       @unique
+  idempotencyKey      String?      @unique
+  checkoutRequestHash String?
+  subtotalPesewas     Int
+  totalPesewas        Int
+  amountPaidPesewas   Int
+  changePesewas       Int          @default(0)
+  paymentMethod       String
+  status              String       @default("completed")
+  createdAt           DateTime     @default(now())
+  staffId             String?
+  staff               Staff?       @relation(fields: [staffId], references: [id], onDelete: SetNull)
+  items               SaleItem[]
+  payments            Payment[]
+  returns             SaleReturn[]
 }
 
 model SaleItem {
@@ -63,6 +66,7 @@ model SaleItem {
   productName      String
   sku              String
   quantity         Int
+  returnedQuantity Int    @default(0)
   unitPricePesewas Int
   unitCostPesewas  Int?
   lineTotalPesewas Int
@@ -91,6 +95,8 @@ model Payment {
 model SaleReturn {
   id                  String   @id @default(cuid())
   returnNumber        String   @unique
+  idempotencyKey      String?  @unique
+  returnRequestHash   String?
   saleId              String
   refundAmountPesewas Int
   refundMethod        String
@@ -123,18 +129,17 @@ model SaleReturnItem {
   @@index([productId])
 }
 
-
 model Staff {
-  id           String    @id @default(cuid())
-  username     String    @unique
+  id           String   @id @default(cuid())
+  username     String   @unique
   passwordHash String
-  role         String    @default("CASHIER")
-  isActive     Boolean   @default(true)
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+  role         String   @default("CASHIER")
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
-  sessions     Session[]
-  sales        Sale[]
+  sessions Session[]
+  sales    Sale[]
 }
 
 model Session {
@@ -144,8 +149,19 @@ model Session {
   expiresAt DateTime
   createdAt DateTime @default(now())
 
-  staff     Staff    @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  staff Staff @relation(fields: [staffId], references: [id], onDelete: Cascade)
 
   @@index([staffId])
   @@index([expiresAt])
+}
+
+model BusinessSettings {
+  id            String   @id @default("default")
+  businessName  String   @default("My Shop")
+  address       String?
+  phone         String?
+  email         String?
+  receiptFooter String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 }

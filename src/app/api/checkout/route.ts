@@ -1,6 +1,7 @@
 ﻿
 import { NextResponse } from "next/server";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
+import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { requireStaff } from "@/lib/auth";
@@ -26,12 +27,70 @@ const checkoutSchema = z.object({
   reference: z.string().trim().max(100).optional(),
 });
 
+const saleInclude = {
+  items: true,
+  payments: true,
+  staff: {
+    select: {
+      username: true,
+    },
+  },
+} satisfies Prisma.SaleInclude;
+
+function requestHash(data: {
+  items: Array<{ productId: string; quantity: number }>;
+  paymentMethod: string;
+  amountPaidPesewas: number;
+  reference?: string;
+}) {
+  const canonicalRequest = JSON.stringify({
+    items: [...data.items].sort((a, b) =>
+      a.productId.localeCompare(b.productId)
+    ),
+    paymentMethod: data.paymentMethod,
+    amountPaidPesewas: data.amountPaidPesewas,
+    reference: data.reference || null,
+  });
+
+  return createHash("sha256").update(canonicalRequest).digest("hex");
+}
+
+function existingSaleResponse(
+  sale: { checkoutRequestHash: string | null } & object,
+  expectedHash: string
+) {
+  if (sale.checkoutRequestHash !== expectedHash) {
+    return NextResponse.json(
+      {
+        error:
+          "This checkout key has already been used for different sale details. Start a new checkout attempt.",
+      },
+      { status: 409 }
+    );
+  }
+
+  return NextResponse.json({ sale }, { status: 200 });
+}
+
 export async function POST(request: Request) {
   const auth = await requireStaff();
 
   if (auth.error) {
     return auth.error;
   }
+
+  const keyResult = z.string().uuid().safeParse(
+    request.headers.get("Idempotency-Key")
+  );
+
+  if (!keyResult.success) {
+    return NextResponse.json(
+      { error: "A valid checkout idempotency key is required." },
+      { status: 400 }
+    );
+  }
+
+  const idempotencyKey = keyResult.data;
 
   let body: unknown;
 
@@ -77,8 +136,44 @@ export async function POST(request: Request) {
     quantities.set(item.productId, combinedQuantity);
   }
 
+  const normalizedItems = [...quantities.entries()].map(
+    ([productId, quantity]) => ({ productId, quantity })
+  );
+
+  const checkoutRequestHash = requestHash({
+    items: normalizedItems,
+    paymentMethod,
+    amountPaidPesewas,
+    reference,
+  });
+
   try {
+    // Return the original sale if this request was already completed.
+    const previousSale = await prisma.sale.findUnique({
+      where: { idempotencyKey },
+      include: saleInclude,
+    });
+
+    if (previousSale) {
+      return existingSaleResponse(previousSale, checkoutRequestHash);
+    }
+
     const result = await prisma.$transaction(async (tx) => {
+      // Check again inside the transaction in case the request was completed
+      // after the initial lookup.
+      const saleWithKey = await tx.sale.findUnique({
+        where: { idempotencyKey },
+        include: saleInclude,
+      });
+
+      if (saleWithKey) {
+        if (saleWithKey.checkoutRequestHash !== checkoutRequestHash) {
+          throw new Error("IDEMPOTENCY_KEY_REUSED");
+        }
+
+        return { sale: saleWithKey, duplicate: true };
+      }
+
       const saleItems: Array<{
         productId: string;
         productName: string;
@@ -182,6 +277,8 @@ export async function POST(request: Request) {
         data: {
           staffId: auth.staff.id,
           receiptNumber,
+          idempotencyKey,
+          checkoutRequestHash,
           subtotalPesewas,
           totalPesewas: subtotalPesewas,
           amountPaidPesewas,
@@ -199,15 +296,7 @@ export async function POST(request: Request) {
             },
           },
         },
-        include: {
-          items: true,
-          payments: true,
-          staff: {
-            select: {
-              username: true,
-            },
-          },
-        },
+        include: saleInclude,
       });
 
       // Stock movements and the sale are committed or rolled back together.
@@ -223,12 +312,41 @@ export async function POST(request: Request) {
         });
       }
 
-      return sale;
+      return { sale, duplicate: false };
     });
 
-    return NextResponse.json({ sale: result }, { status: 201 });
+    return NextResponse.json(
+      { sale: result.sale },
+      { status: result.duplicate ? 200 : 201 }
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
+
+    if (message === "IDEMPOTENCY_KEY_REUSED") {
+      return NextResponse.json(
+        {
+          error:
+            "This checkout key has already been used for different sale details.",
+        },
+        { status: 409 }
+      );
+    }
+
+    // If another simultaneous request won the unique-key race,
+    // return its completed sale rather than creating another one.
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === "P2002"
+    ) {
+      const winningSale = await prisma.sale.findUnique({
+        where: { idempotencyKey },
+        include: saleInclude,
+      });
+
+      if (winningSale) {
+        return existingSaleResponse(winningSale, checkoutRequestHash);
+      }
+    }
 
     if (message === "PRODUCT_NOT_AVAILABLE") {
       return NextResponse.json(
@@ -239,7 +357,9 @@ export async function POST(request: Request) {
 
     if (message.startsWith("INSUFFICIENT_STOCK:")) {
       return NextResponse.json(
-        { error: `${message.slice("INSUFFICIENT_STOCK:".length)} has insufficient stock.` },
+        {
+          error: `${message.slice("INSUFFICIENT_STOCK:".length)} has insufficient stock.`,
+        },
         { status: 409 }
       );
     }
@@ -272,7 +392,8 @@ export async function POST(request: Request) {
 
     return NextResponse.json(
       {
-        error: "Could not complete the sale. Please check the sales history before retrying.",
+        error:
+          "Could not complete the sale. Please check the sales history before retrying.",
       },
       { status: 500 }
     );

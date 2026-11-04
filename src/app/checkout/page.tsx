@@ -1,8 +1,8 @@
 ﻿
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import LogoutButton from "@/components/logout-button";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useToast } from "@/components/ui/toast-provider";
 
 type Product = {
   id: string;
@@ -19,6 +19,16 @@ type CartItem = {
   quantity: number;
 };
 
+type BusinessSettings = {
+  businessName: string;
+  address: string | null;
+  phone: string | null;
+  email: string | null;
+  receiptFooter: string | null;
+};
+
+type PaymentMethod = "cash" | "mobile_money" | "card";
+
 type CheckoutResult = {
   sale: {
     id: string;
@@ -27,7 +37,7 @@ type CheckoutResult = {
     totalPesewas: number;
     amountPaidPesewas: number;
     changePesewas: number;
-    paymentMethod: "cash" | "mobile_money" | "card";
+    paymentMethod: PaymentMethod;
     createdAt: string;
     staff: {
       username: string;
@@ -49,14 +59,33 @@ const money = (pesewas: number) =>
     currency: "GHS",
   }).format(pesewas / 100);
 
+const paymentLabels: Record<PaymentMethod, string> = {
+  cash: "Cash",
+  mobile_money: "Mobile Money",
+  card: "Card",
+};
+
 export default function CheckoutPage() {
+  const { showToast } = useToast();
+
   const [products, setProducts] = useState<Product[]>([]);
+  const [productsLoading, setProductsLoading] = useState(true);
+
+  const [businessSettings, setBusinessSettings] =
+    useState<BusinessSettings>({
+      businessName: "My Shop",
+      address: null,
+      phone: null,
+      email: null,
+      receiptFooter: null,
+    });
+
   const [cart, setCart] = useState<CartItem[]>([]);
   const [search, setSearch] = useState("");
-  const [paymentMethod, setPaymentMethod] = useState("cash");
+  const [paymentMethod, setPaymentMethod] =
+    useState<PaymentMethod>("cash");
   const [amountPaid, setAmountPaid] = useState("");
   const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState("");
   const [receipt, setReceipt] =
     useState<CheckoutResult["sale"] | null>(null);
   const [quantityInputs, setQuantityInputs] =
@@ -64,7 +93,14 @@ export default function CheckoutPage() {
 
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  async function loadProducts() {
+  const idempotencyRef = useRef<{
+    fingerprint: string;
+    key: string;
+  } | null>(null);
+
+  const checkoutInProgressRef = useRef(false);
+
+  const loadProducts = useCallback(async () => {
     const response = await fetch("/api/products", {
       cache: "no-store",
     });
@@ -87,12 +123,58 @@ export default function CheckoutPage() {
         barcode: product.barcode ?? null,
       }))
     );
-  }
+  }, []);
 
   useEffect(() => {
-    loadProducts().catch(() => {
-      setMessage("Could not load products. Please refresh the page.");
-    });
+    let cancelled = false;
+
+    async function initialise() {
+      try {
+        await loadProducts();
+      } catch {
+        if (!cancelled) {
+          showToast("Could not load products. Please refresh the page.", "error");
+        }
+      } finally {
+        if (!cancelled) {
+          setProductsLoading(false);
+        }
+      }
+    }
+
+    void initialise();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [loadProducts, showToast]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadBusinessSettings() {
+      try {
+        const response = await fetch("/api/settings", {
+          cache: "no-store",
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+
+          if (!cancelled && data.settings) {
+            setBusinessSettings(data.settings);
+          }
+        }
+      } catch (error) {
+        console.error("Could not load business settings:", error);
+      }
+    }
+
+    void loadBusinessSettings();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const filteredProducts = useMemo(() => {
@@ -104,6 +186,7 @@ export default function CheckoutPage() {
         product.stockQuantity > 0 &&
         (!term ||
           product.name.toLowerCase().includes(term) ||
+          product.sku.toLowerCase().includes(term) ||
           (product.barcode ?? "").toLowerCase().includes(term))
     );
   }, [products, search]);
@@ -119,20 +202,26 @@ export default function CheckoutPage() {
   const balanceDue = Math.max(0, total - paidPesewas);
 
   function addProduct(product: Product) {
-    setMessage("");
     setReceipt(null);
 
+    const existing = cart.find(
+      (item) => item.product.id === product.id
+    );
+
+    if (existing && existing.quantity >= product.stockQuantity) {
+      showToast(
+        `Maximum available stock for ${product.name} reached.`,
+        "warning"
+      );
+      return;
+    }
+
     setCart((current) => {
-      const existing = current.find(
+      const currentItem = current.find(
         (item) => item.product.id === product.id
       );
 
-      if (existing) {
-        if (existing.quantity >= product.stockQuantity) {
-          setMessage(`Maximum available stock for ${product.name} reached.`);
-          return current;
-        }
-
+      if (currentItem) {
         return current.map((item) =>
           item.product.id === product.id
             ? { ...item, quantity: item.quantity + 1 }
@@ -160,12 +249,12 @@ export default function CheckoutPage() {
     );
 
     if (!product) {
-      setMessage("No product found with that barcode.");
+      showToast("No product found with that barcode.", "error");
       return;
     }
 
     if (!product.isActive || product.stockQuantity <= 0) {
-      setMessage(`${product.name} is inactive or out of stock.`);
+      showToast(`${product.name} is inactive or out of stock.`, "warning");
       return;
     }
 
@@ -193,40 +282,67 @@ export default function CheckoutPage() {
   }
 
   async function completeSale() {
-    setMessage("");
+    if (checkoutInProgressRef.current) return;
+
     setReceipt(null);
 
     if (cart.length === 0) {
-      setMessage("Add at least one product to the cart.");
+      showToast("Add at least one product to the cart.", "warning");
       return;
     }
 
     if (!Number.isFinite(paidPesewas) || paidPesewas < 0) {
-      setMessage("Enter a valid payment amount.");
+      showToast("Enter a valid payment amount.", "error");
       return;
     }
 
     if (paymentMethod === "cash" && paidPesewas < total) {
-      setMessage("The cash received is less than the total.");
+      showToast("The cash received is less than the total.", "error");
       return;
     }
 
     if (paymentMethod !== "cash" && paidPesewas !== total) {
-      setMessage("For Mobile Money or card, enter the exact total.");
+      showToast(
+        "For Mobile Money or card, enter the exact total.",
+        "error"
+      );
       return;
     }
 
+    const checkoutItems = cart
+      .map((item) => ({
+        productId: item.product.id,
+        quantity: item.quantity,
+      }))
+      .sort((a, b) => a.productId.localeCompare(b.productId));
+
+    const fingerprint = JSON.stringify({
+      items: checkoutItems,
+      paymentMethod,
+      amountPaidPesewas: paidPesewas,
+    });
+
+    if (idempotencyRef.current?.fingerprint !== fingerprint) {
+      idempotencyRef.current = {
+        fingerprint,
+        key: crypto.randomUUID(),
+      };
+    }
+
+    const idempotencyKey = idempotencyRef.current.key;
+
+    checkoutInProgressRef.current = true;
     setLoading(true);
 
     try {
       const response = await fetch("/api/checkout", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": idempotencyKey,
+        },
         body: JSON.stringify({
-          items: cart.map((item) => ({
-            productId: item.product.id,
-            quantity: item.quantity,
-          })),
+          items: checkoutItems,
           paymentMethod,
           amountPaidPesewas: paidPesewas,
         }),
@@ -238,67 +354,105 @@ export default function CheckoutPage() {
         throw new Error(data.error || "Checkout failed.");
       }
 
+      idempotencyRef.current = null;
+
       setReceipt(data.sale);
       setCart([]);
       setAmountPaid("");
       setQuantityInputs({});
-      await loadProducts();
+
+      showToast("Sale completed successfully.", "success");
+
+      // The sale is already confirmed. A refresh failure must not
+      // make the cashier think the sale itself failed.
+      try {
+        await loadProducts();
+      } catch {
+        showToast(
+          "Sale completed, but product stock could not refresh. Please refresh the page.",
+          "warning"
+        );
+      }
     } catch (error) {
-      setMessage(
+      showToast(
         error instanceof Error
           ? error.message
-          : "Could not complete the sale."
+          : "Could not complete the sale.",
+        "error"
       );
     } finally {
+      checkoutInProgressRef.current = false;
       setLoading(false);
     }
   }
 
   return (
-    <main className="min-h-screen bg-slate-100 p-4 text-slate-900 sm:p-8">
-      <div className="mx-auto max-w-6xl">
-        <header className="mb-6 flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
-          <div>
-            <p className="text-sm font-semibold uppercase tracking-wide text-blue-700">
-              Retail POS
-            </p>
-            <h1 className="mt-1 text-3xl font-bold">Checkout</h1>
-            <p className="mt-2 text-slate-600">
-              Select products, collect payment and complete a sale.
-            </p>
+    <main className="min-h-screen bg-[#f7f8fc] px-4 py-6 text-[#172033] sm:px-6 lg:px-8">
+      <div className="mx-auto max-w-7xl">
+        <header className="mb-7">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-sm font-semibold text-[#6d4aff]">
+                {businessSettings.businessName}
+              </p>
+              <h1 className="mt-1 text-2xl font-bold tracking-tight sm:text-3xl">
+                Checkout
+              </h1>
+              <p className="mt-1 text-sm text-slate-500">
+                Select products, collect payment and complete a sale.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 self-start rounded-xl border border-[#e9e7f2] bg-white px-3 py-2 text-sm text-slate-600">
+              <span className="h-2 w-2 rounded-full bg-emerald-500" />
+              Point of sale
+            </div>
           </div>
-          <LogoutButton />
         </header>
 
-        {message && (
-          <div
-            role="alert"
-            className="mb-4 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
-          >
-            {message}
-          </div>
-        )}
-
         {receipt && (
-          <section className="print-receipt mb-6 rounded-xl border border-green-200 bg-white p-5 shadow-sm">
+          <section className="print-receipt mb-6 rounded-2xl border border-emerald-200 bg-white p-5 shadow-sm sm:p-7">
             <div className="receipt-content mx-auto max-w-md">
-              <h2 className="text-center text-2xl font-bold">
+              <div className="no-print mb-5 flex items-center gap-2 rounded-lg bg-emerald-50 p-3 text-sm font-medium text-emerald-800">
+                <span className="flex h-7 w-7 items-center justify-center rounded-full bg-emerald-100">
+                  ✓
+                </span>
                 Sale completed successfully
+              </div>
+
+              <h2 className="text-center text-2xl font-bold">
+                {businessSettings.businessName}
               </h2>
 
-              <p className="mt-1 text-center text-sm text-gray-600">
-                RETAIL POS
-              </p>
+              {businessSettings.address && (
+                <p className="text-center text-sm text-gray-600">
+                  {businessSettings.address}
+                </p>
+              )}
+
+              {businessSettings.phone && (
+                <p className="text-center text-sm text-gray-600">
+                  Tel: {businessSettings.phone}
+                </p>
+              )}
+
+              {businessSettings.email && (
+                <p className="text-center text-sm text-gray-600">
+                  {businessSettings.email}
+                </p>
+              )}
 
               <div className="my-4 border-t border-dashed border-gray-400" />
 
               <p className="text-sm">
                 <strong>Receipt:</strong> {receipt.receiptNumber}
               </p>
+
               <p className="text-sm">
                 <strong>Date:</strong>{" "}
                 {new Date(receipt.createdAt).toLocaleString("en-GH")}
               </p>
+
               <p className="text-sm">
                 <strong>Cashier:</strong>{" "}
                 {receipt.staff?.username ?? "Staff"}
@@ -346,126 +500,217 @@ export default function CheckoutPage() {
                 </div>
                 <div className="flex justify-between">
                   <span>Payment method</span>
-                  <span className="capitalize">
-                    {receipt.paymentMethod.replace("_", " ")}
-                  </span>
+                  <span>{paymentLabels[receipt.paymentMethod]}</span>
                 </div>
               </div>
 
               <p className="mt-6 text-center text-sm">
-                Thank you for shopping with us!
+                {businessSettings.receiptFooter ||
+                  "Thank you for shopping with us!"}
               </p>
 
-              <div className="no-print mt-5 flex gap-3">
+              <div className="no-print mt-5 flex flex-wrap gap-3">
                 <button
                   type="button"
                   onClick={() => window.print()}
-                  className="rounded-lg bg-green-700 px-4 py-2 font-semibold text-white"
+                  className="rounded-xl bg-[#6d4aff] px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-[#5836e6]"
                 >
                   Print receipt
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setReceipt(null);
+                    setSearch("");
+                    searchInputRef.current?.focus();
+                  }}
+                  className="rounded-xl border border-slate-200 px-5 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
+                >
+                  New sale
                 </button>
               </div>
             </div>
           </section>
         )}
 
-        <div className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
-          <section className="rounded-xl bg-white p-5 shadow-sm">
-            <h2 className="text-lg font-bold">Products</h2>
+        <div className="grid items-start gap-6 xl:grid-cols-[1.2fr_0.8fr]">
+          <section className="min-w-0 rounded-2xl border border-[#e9e7f2] bg-white p-5 shadow-sm sm:p-6">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-bold">Products</h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  Search for a product or scan its barcode.
+                </p>
+              </div>
+              <span className="rounded-full bg-[#f1edff] px-3 py-1 text-xs font-semibold text-[#6d4aff]">
+                {filteredProducts.length} available
+              </span>
+            </div>
 
             <label
-              className="mt-4 block text-sm font-medium"
+              className="mt-5 block text-sm font-medium text-slate-700"
               htmlFor="search"
             >
-              Search by name or scan barcode
+              Product search
             </label>
 
-            <input
-              ref={searchInputRef}
-              id="search"
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              onKeyDown={handleSearchKeyDown}
-              placeholder="Type product name or scan barcode..."
-              autoComplete="off"
-              className="mt-2 w-full rounded-lg border border-slate-300 p-3 outline-none focus:border-blue-500"
-            />
-
-            <div className="mt-4 grid gap-3 sm:grid-cols-2">
-              {filteredProducts.map((product) => (
-                <button
-                  type="button"
-                  key={product.id}
-                  onClick={() => addProduct(product)}
-                  className="rounded-lg border border-slate-200 p-4 text-left transition hover:border-blue-500 hover:bg-blue-50"
+            <div className="relative mt-2">
+              <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  className="h-5 w-5"
                 >
-                  <span className="block font-semibold">
-                    {product.name}
-                  </span>
-
-                  {product.barcode && (
-                    <span className="mt-1 block text-sm text-slate-500">
-                      Barcode: {product.barcode}
-                    </span>
-                  )}
-
-                  <span className="mt-2 block font-bold text-blue-700">
-                    {money(product.sellingPricePesewas)}
-                  </span>
-
-                  <span className="mt-1 block text-sm text-slate-500">
-                    Stock: {product.stockQuantity}
-                  </span>
-                </button>
-              ))}
-
-              {filteredProducts.length === 0 && (
-                <p className="text-sm text-slate-500">
-                  No available products match your search.
-                </p>
-              )}
+                  <circle cx="11" cy="11" r="7" />
+                  <path d="m16 16 4 4" />
+                </svg>
+              </span>
+              <input
+                ref={searchInputRef}
+                id="search"
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                onKeyDown={handleSearchKeyDown}
+                placeholder="Search name, SKU or scan barcode..."
+                autoComplete="off"
+                className="w-full rounded-xl border border-slate-200 bg-[#fbfbfd] py-3 pl-10 pr-4 text-sm outline-none transition placeholder:text-slate-400 focus:border-[#9b86ff] focus:ring-4 focus:ring-[#6d4aff]/10"
+              />
             </div>
+
+            {productsLoading ? (
+              <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                {Array.from({ length: 6 }).map((_, index) => (
+                  <div
+                    key={index}
+                    className="animate-pulse rounded-xl border border-slate-100 p-4"
+                  >
+                    <div className="h-4 w-2/3 rounded bg-slate-100" />
+                    <div className="mt-3 h-3 w-1/3 rounded bg-slate-100" />
+                    <div className="mt-5 h-5 w-1/2 rounded bg-slate-100" />
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                {filteredProducts.map((product) => (
+                  <button
+                    type="button"
+                    key={product.id}
+                    onClick={() => addProduct(product)}
+                    className="group rounded-xl border border-slate-200 p-4 text-left transition hover:border-[#b9aaff] hover:bg-[#faf9ff] focus:outline-none focus:ring-4 focus:ring-[#6d4aff]/10"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <span className="block truncate font-semibold text-slate-800">
+                          {product.name}
+                        </span>
+                        <span className="mt-1 block text-xs text-slate-400">
+                          SKU: {product.sku}
+                        </span>
+                      </div>
+                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[#f1edff] text-lg font-medium text-[#6d4aff] transition group-hover:bg-[#6d4aff] group-hover:text-white">
+                        +
+                      </span>
+                    </div>
+
+                    {product.barcode && (
+                      <span className="mt-2 block truncate text-xs text-slate-500">
+                        Barcode: {product.barcode}
+                      </span>
+                    )}
+
+                    <div className="mt-4 flex items-end justify-between gap-2">
+                      <span className="font-bold text-[#6d4aff]">
+                        {money(product.sellingPricePesewas)}
+                      </span>
+                      <span className="text-xs text-slate-500">
+                        Stock: {product.stockQuantity}
+                      </span>
+                    </div>
+                  </button>
+                ))}
+
+                {filteredProducts.length === 0 && (
+                  <div className="col-span-full rounded-xl border border-dashed border-slate-200 px-4 py-10 text-center">
+                    <p className="font-medium text-slate-700">
+                      No available products found
+                    </p>
+                    <p className="mt-1 text-sm text-slate-500">
+                      Try another search or check your product stock.
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
           </section>
 
-          <section className="rounded-xl bg-white p-5 shadow-sm">
-            <h2 className="text-lg font-bold">Current sale</h2>
+          <section className="min-w-0 rounded-2xl border border-[#e9e7f2] bg-white p-5 shadow-sm sm:p-6">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-bold">Current sale</h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  Review items and collect payment.
+                </p>
+              </div>
+              <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
+                {cart.reduce((sum, item) => sum + item.quantity, 0)} items
+              </span>
+            </div>
 
             {cart.length === 0 ? (
-              <p className="mt-4 text-slate-500">
-                Your cart is empty. Select a product to begin.
-              </p>
+              <div className="mt-5 rounded-xl border border-dashed border-slate-200 px-4 py-10 text-center">
+                <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-[#f1edff] text-[#6d4aff]">
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.7"
+                    className="h-6 w-6"
+                  >
+                    <path d="M3 3h2l2.2 11.2a2 2 0 0 0 2 1.6h8.6a2 2 0 0 0 2-1.6L21 8H6" />
+                    <circle cx="10" cy="20" r="1" />
+                    <circle cx="18" cy="20" r="1" />
+                  </svg>
+                </div>
+                <p className="mt-3 font-medium text-slate-700">
+                  Your cart is empty
+                </p>
+                <p className="mt-1 text-sm text-slate-500">
+                  Select a product to begin a sale.
+                </p>
+              </div>
             ) : (
-              <div className="mt-4 space-y-4">
+              <div className="mt-5 max-h-[420px] space-y-4 overflow-y-auto pr-1">
                 {cart.map((item) => (
                   <div
                     key={item.product.id}
-                    className="border-b border-slate-100 pb-4"
+                    className="border-b border-slate-100 pb-4 last:border-0"
                   >
                     <div className="flex justify-between gap-3">
-                      <div>
-                        <p className="font-semibold">
+                      <div className="min-w-0">
+                        <p className="truncate font-semibold text-slate-800">
                           {item.product.name}
                         </p>
-                        <p className="text-sm text-slate-500">
+                        <p className="mt-1 text-xs text-slate-500">
                           {money(item.product.sellingPricePesewas)} each
                         </p>
                       </div>
-
-                      <p className="font-semibold">
+                      <p className="shrink-0 font-semibold text-slate-800">
                         {money(
                           item.product.sellingPricePesewas * item.quantity
                         )}
                       </p>
                     </div>
 
-                    <div className="mt-3 flex items-center gap-3">
+                    <div className="mt-3 flex flex-wrap items-center gap-3">
                       <label
-                        className="text-sm text-slate-600"
+                        className="text-xs font-medium text-slate-500"
                         htmlFor={`qty-${item.product.id}`}
                       >
                         Quantity
                       </label>
-
                       <input
                         id={`qty-${item.product.id}`}
                         type="number"
@@ -490,7 +735,9 @@ export default function CheckoutPage() {
 
                           const nextQuantity = Number(value);
 
-                          if (nextQuantity > item.product.stockQuantity) {
+                          if (
+                            nextQuantity > item.product.stockQuantity
+                          ) {
                             return;
                           }
 
@@ -508,11 +755,10 @@ export default function CheckoutPage() {
                             return next;
                           });
                         }}
-                        className="w-24 rounded-lg border p-2"
+                        className="w-20 rounded-lg border border-slate-200 px-2 py-1.5 text-sm outline-none focus:border-[#9b86ff] focus:ring-2 focus:ring-[#6d4aff]/10"
                       />
-
-                      <span className="text-xs text-slate-500">
-                        Max {item.product.stockQuantity}
+                      <span className="text-xs text-slate-400">
+                        Maximum: {item.product.stockQuantity}
                       </span>
                     </div>
                   </div>
@@ -520,24 +766,27 @@ export default function CheckoutPage() {
               </div>
             )}
 
-            <div className="mt-5 border-t pt-4">
-              <div className="flex items-center justify-between text-xl font-bold">
-                <span>Total</span>
-                <span>{money(total)}</span>
+            <div className="mt-5 border-t border-slate-100 pt-5">
+              <div className="flex items-center justify-between">
+                <span className="font-medium text-slate-600">Total</span>
+                <span className="text-2xl font-bold tracking-tight text-[#6d4aff]">
+                  {money(total)}
+                </span>
               </div>
 
               <label
                 htmlFor="paymentMethod"
-                className="mt-5 block text-sm font-medium"
+                className="mt-5 block text-sm font-medium text-slate-700"
               >
                 Payment method
               </label>
-
               <select
                 id="paymentMethod"
                 value={paymentMethod}
-                onChange={(event) => setPaymentMethod(event.target.value)}
-                className="mt-2 w-full rounded-lg border border-slate-300 p-3"
+                onChange={(event) =>
+                  setPaymentMethod(event.target.value as PaymentMethod)
+                }
+                className="mt-2 w-full rounded-xl border border-slate-200 bg-white p-3 text-sm outline-none transition focus:border-[#9b86ff] focus:ring-4 focus:ring-[#6d4aff]/10"
               >
                 <option value="cash">Cash</option>
                 <option value="mobile_money">Mobile Money</option>
@@ -546,11 +795,10 @@ export default function CheckoutPage() {
 
               <label
                 htmlFor="amountPaid"
-                className="mt-4 block text-sm font-medium"
+                className="mt-4 block text-sm font-medium text-slate-700"
               >
                 Amount received (GH₵)
               </label>
-
               <input
                 id="amountPaid"
                 type="number"
@@ -559,18 +807,18 @@ export default function CheckoutPage() {
                 value={amountPaid}
                 onChange={(event) => setAmountPaid(event.target.value)}
                 placeholder="e.g. 20.00"
-                className="mt-2 w-full rounded-lg border border-slate-300 p-3"
+                className="mt-2 w-full rounded-xl border border-slate-200 p-3 text-sm outline-none transition focus:border-[#9b86ff] focus:ring-4 focus:ring-[#6d4aff]/10"
               />
 
               {paymentMethod === "cash" && (
-                <div className="mt-3 space-y-2 rounded-lg bg-slate-50 p-3">
+                <div className="mt-4 rounded-xl bg-[#f7f8fc] p-4">
                   {balanceDue > 0 ? (
-                    <div className="flex justify-between text-red-700">
+                    <div className="flex justify-between gap-3 text-sm text-rose-600">
                       <span>Balance remaining</span>
                       <strong>{money(balanceDue)}</strong>
                     </div>
                   ) : (
-                    <div className="flex justify-between text-green-700">
+                    <div className="flex justify-between gap-3 text-sm text-emerald-700">
                       <span>Change due</span>
                       <strong>{money(Math.max(0, change))}</strong>
                     </div>
@@ -581,11 +829,18 @@ export default function CheckoutPage() {
               <button
                 type="button"
                 onClick={completeSale}
-                disabled={loading || cart.length === 0}
-                className="mt-5 w-full rounded-lg bg-blue-700 px-4 py-3 font-semibold text-white hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={loading || cart.length === 0 || productsLoading}
+                className="mt-5 flex w-full items-center justify-center gap-2 rounded-xl bg-[#6d4aff] px-4 py-3.5 text-sm font-semibold text-white shadow-sm transition hover:bg-[#5836e6] disabled:cursor-not-allowed disabled:opacity-50"
               >
+                {loading && (
+                  <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" />
+                )}
                 {loading ? "Processing sale..." : "Complete sale"}
               </button>
+
+              <p className="mt-3 text-center text-xs text-slate-400">
+                Review the total and payment amount before completing the sale.
+              </p>
             </div>
           </section>
         </div>
